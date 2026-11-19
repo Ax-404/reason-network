@@ -48,10 +48,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relays: Vec<String>,
     /// Optional Tailscale interface address to bind when [`Self::tailnet_only`] is on (must be in `100.64.0.0/10` or
-    /// `fd7a:115c:a1e0::/48`). When unset, every such address on this machine is used. Ignored when `tailnet_only` is
-    /// off.
+    /// `fd7a:115c:a1e0::/48`). When unset, every such address on this machine is used. On Windows, set this: interface
+    /// auto-detection is not implemented there. Ignored when `tailnet_only` is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tailnet_bind: Option<String>,
+    /// Optional DNS nameserver IP when [`Self::tailnet_only`] is on (e.g. Tailscale MagicDNS `100.100.100.100`). When
+    /// unset, the host's system resolvers are used with public fallbacks disabled. Ignored when `tailnet_only` is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet_dns: Option<String>,
     /// The UDP port teammates reach this machine on directly, e.g. `41641` for a firewall or router rule. None: a
     /// random one each start. Taken by something else, a random one is used.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +113,7 @@ impl Default for Config {
             tailnet_only: false,
             relays: Vec::new(),
             tailnet_bind: None,
+            tailnet_dns: None,
             port: None,
             debug_log: false,
             inbound: Inbound::default(),
@@ -178,7 +183,8 @@ impl Config {
     }
 
     fn read_private(text: &str) -> Self {
-        if let Ok(cfg) = toml::from_str(text) {
+        if let Ok(mut cfg) = toml::from_str::<Self>(text) {
+            cfg.apply_tailnet_validation();
             return cfg;
         }
         let table = match text.parse::<toml::Table>() {
@@ -207,6 +213,7 @@ impl Config {
         key!(tailnet_only, false);
         key!(relays, Vec::new());
         key!(tailnet_bind, None);
+        key!(tailnet_dns, None);
         key!(port, None);
         key!(debug_log, false);
         if let Some(value) = table.get("folders") {
@@ -259,16 +266,58 @@ impl Config {
             cfg.lan = false;
             cfg.unreadable = Some(errors.join("; "));
         }
+        cfg.apply_tailnet_validation();
         cfg
     }
 
     /// Like `load`, but a file that doesn't parse is an error (before rewriting it, say).
     pub fn load_strict() -> Result<Self> {
         match std::fs::read_to_string(paths::config()) {
-            Ok(s) => Ok(toml::from_str(&s)?),
+            Ok(s) => {
+                let cfg: Self = toml::from_str(&s)?;
+                if let Some(error) = cfg.tailnet_field_errors() {
+                    anyhow::bail!(error);
+                }
+                Ok(cfg)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// When `tailnet_only` is set in the file, check `relays`, `tailnet_bind`, and `tailnet_dns` early.
+    fn apply_tailnet_validation(&mut self) {
+        if let Some(error) = self.tailnet_field_errors() {
+            self.lan = false;
+            self.unreadable = Some(match self.unreadable.take() {
+                Some(prior) => format!("{prior}; {error}"),
+                None => error,
+            });
+        }
+    }
+
+    /// Problems with `tailnet_only` fields, if that flag is on in the file (not via CLI alone).
+    fn tailnet_field_errors(&self) -> Option<String> {
+        if !self.tailnet_only {
+            return None;
+        }
+        let mut errors = Vec::new();
+        for url in &self.relays {
+            if let Err(e) = crate::net::parse_https_relay_url(url) {
+                errors.push(format!("relays: {e:#}"));
+            }
+        }
+        if let Some(bind) = self.tailnet_bind.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && let Err(e) = crate::tailnet::parse_bind_ip(bind)
+        {
+            errors.push(format!("tailnet_bind: {e:#}"));
+        }
+        if let Some(dns) = self.tailnet_dns.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && dns.parse::<std::net::IpAddr>().is_err()
+        {
+            errors.push(format!("tailnet_dns is not an IP address: {dns}"));
+        }
+        (!errors.is_empty()).then(|| errors.join("; "))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -766,13 +815,26 @@ bob = false
             r#"
 tailnet_only = true
 tailnet_bind = "100.64.1.10"
+tailnet_dns = "100.100.100.100"
 relays = ["https://relay.example.ts.net:10443", "https://relay-b.example.ts.net:8443"]
 "#,
         );
         assert!(cfg.tailnet_only());
+        assert!(cfg.warning().is_none());
         assert!(!cfg.lan(), "mDNS off while tailnet_only");
         assert_eq!(cfg.tailnet_bind.as_deref(), Some("100.64.1.10"));
+        assert_eq!(cfg.tailnet_dns.as_deref(), Some("100.100.100.100"));
         assert_eq!(cfg.relays, ["https://relay.example.ts.net:10443", "https://relay-b.example.ts.net:8443"]);
+    }
+
+    #[test]
+    fn tailnet_only_rejects_bad_relays_and_bind_at_load() {
+        let bad_relay = Config::read_private("tailnet_only = true\nrelays = [\"http://relay.example.ts.net:10443\"]\n");
+        assert!(bad_relay.warning().is_some_and(|w| w.contains("relays")), "{:?}", bad_relay.warning());
+        let bad_bind = Config::read_private("tailnet_only = true\ntailnet_bind = \"127.0.0.1\"\n");
+        assert!(bad_bind.warning().is_some_and(|w| w.contains("tailnet_bind")), "{:?}", bad_bind.warning());
+        let bad_dns = Config::read_private("tailnet_only = true\ntailnet_dns = \"not-an-ip\"\n");
+        assert!(bad_dns.warning().is_some_and(|w| w.contains("tailnet_dns")), "{:?}", bad_dns.warning());
     }
 
     fn temp() -> std::path::PathBuf {

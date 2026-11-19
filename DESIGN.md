@@ -190,10 +190,9 @@ there says to set the same relay with `reason-network relay`.
 That is the "HTTPS and local network, MagicDNS style" requirement with one stack, and a relay as the only server
 (Reason's, or the team's own).
 
-Fork option **`tailnet_only`** (off by default; see [Config](#config)): when enabled, the endpoint uses only
-`presets::Minimal`, disables the portmapper, skips mDNS and Reason's public relay list / GitHub updater, binds solely
-on Tailscale addresses, and allows only relays listed in config (HTTPS URLs may carry an explicit non-443 port such as
-`https://relay.example.ts.net:10443`).
+Fork option **`tailnet_only`** (off by default; see [Config](#tailnet_only)): every endpoint (main, invite, probes)
+uses Minimal, Tailscale-only bind, no portmapper, system DNS without public fallbacks, minimal NetReport, no
+`HTTPS_PROXY`, and only config-listed relays (ports kept, e.g. `https://relay.example.ts.net:10443`).
 
 **Roster (membership).** Replicated to every machine, every entry signed by a member machine's key:
 - *admissions*: how each machine got in (the founder's self-signed entry, then each admission signed by an
@@ -549,7 +548,8 @@ Or paste the invite line into any agent.
 | `auto_update` | `true` | install new releases when they come out (checked every few hours) |
 | `tailnet_only` | `false` | only communicate over a Tailscale tailnet (see below); also `--tailnet-only` |
 | `relays` | none | HTTPS relay URLs allowed when `tailnet_only` is on (explicit ports kept, e.g. `https://relay.example.ts.net:10443`) |
-| `tailnet_bind` | none | optional Tailscale address to bind when `tailnet_only` is on (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`) |
+| `tailnet_bind` | none | Tailscale address to bind when `tailnet_only` is on (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`); **required on Windows** |
+| `tailnet_dns` | none | optional DNS nameserver IP when `tailnet_only` is on (e.g. MagicDNS `100.100.100.100`); else system resolvers only |
 | `reason` | `false` | list your live Reason sessions (set by `reason-network setup`) |
 | `debug_log` | `false` | write the networking library's events to `debug.log`, on this computer only (read when the daemon starts) |
 | `inbound` | accept | see above |
@@ -557,19 +557,32 @@ Or paste the invite line into any agent.
 
 ### `tailnet_only`
 
-Off by default. When off, networking is unchanged. When on (config key or `--tailnet-only` / `REASON_NETWORK_TAILNET_ONLY`), the node:
+Off by default. When off, networking is unchanged (including the historical loose relay-URL parse and iroh's default
+DNS / NetReport / portmapper). When on (config key or `--tailnet-only` / `REASON_NETWORK_TAILNET_ONLY`), **every** iroh
+endpoint this process builds — the main one, invite-code listeners, `check_relay`, and `route_loop` / `reaches` probes —
+shares the same plan in `src/net.rs` (`EndpointPlan`):
 
-- binds UDP only on Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), never `0.0.0.0` / `::` (or on `tailnet_bind` if set); fails clearly if none are found
-- disables mDNS, n0 pkarr/DNS discovery, and the portmapper
-- uses only relays listed in `relays` (never `DEFAULT_RELAYS` or `https://reasonmachines.com/network/relays.json`); a team relay must be on that list; URLs may include a non-443 port
+- binds UDP only on Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), never `0.0.0.0` / `::` (or on
+  `tailnet_bind` if set); fails clearly if none are found. **Windows: set `tailnet_bind`** (no adapter enumeration).
+- `presets::Minimal` (no n0 pkarr/DNS discovery), mDNS off, portmapper disabled
+- DNS: system resolvers only, or optional `tailnet_dns` (e.g. MagicDNS `100.100.100.100`), with public fallbacks
+  (1.1.1.1 / 8.8.8.8 / Quad9 / DoH) disabled via `DnsResolver::builder().disable_fallback()`
+- NetReport: `NetReportConfig::minimal()` — no HTTPS latency probes and no captive-portal checks; remaining QUIC
+  address discovery only targets the configured relays
+- `HTTPS_PROXY` / `ALL_PROXY` ignored for iroh (no off-tailnet CONNECT; `route_loop` does not switch via a proxy)
+- uses only relays listed in `relays` (never `DEFAULT_RELAYS` or `https://reasonmachines.com/network/relays.json`); a
+  team relay must be on that list; HTTPS URLs may include a non-443 port
 - skips GitHub auto-update and the periodic relay-list fetch
 - does not call `mcp.reasonmachines.com` (this engine never did; hosted MCP stays a separate client-side setup)
+
+`relays`, `tailnet_bind`, and `tailnet_dns` are validated when the config file has `tailnet_only = true`.
 
 Example (names and addresses are fictional):
 
 ```toml
 tailnet_only = true
 tailnet_bind = "100.64.1.10"
+# tailnet_dns = "100.100.100.100"
 relays = ["https://relay.example.ts.net:10443"]
 ```
 

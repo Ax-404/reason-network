@@ -3,6 +3,8 @@
 //!
 //! Example addresses only (never a real MagicDNS name or production tailnet IP):
 //! `100.64.1.10`, `fd7a:115c:a1e0::1`, `https://relay.example.ts.net:10443`.
+//!
+//! On Windows, set `tailnet_bind` in config: this module does not enumerate adapters there.
 
 use anyhow::{Result, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -139,12 +141,5 @@ mod tests {
         assert!(err.contains("tailnet_only is on"), "{err}");
         assert!(err.contains("no Tailscale interface"), "{err}");
         assert!(err.contains("tailnet_bind"), "{err}");
-    }
-
-    #[test]
-    fn example_relay_port_is_not_stripped_from_docs_constant() {
-        // Documented example form used throughout this fork.
-        let example = "https://relay.example.ts.net:10443";
-        assert!(example.contains(":10443"));
     }
 }

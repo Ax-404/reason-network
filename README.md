@@ -133,19 +133,25 @@ daemon logs that and uses a random port, as without it; `port = 0` is the same a
 
 ### Tailscale-only mode
 
-To keep a node on a Tailscale tailnet only (no mDNS, n0 discovery, portmapper, public Reason relays, or GitHub
-auto-update), set in `config.toml` (or pass `--tailnet-only`):
+To keep a node on a Tailscale tailnet only (no mDNS, n0 discovery, portmapper, public Reason relays, GitHub
+auto-update, public DNS fallbacks, or NetReport HTTPS/captive probes), set in `config.toml` (or pass `--tailnet-only`):
 
 ```toml
 tailnet_only = true
-# Optional: pin the Tailscale interface address (CGNAT or Tailscale IPv6 ULA).
+# Pin the Tailscale interface address (required on Windows; elsewhere optional if detection finds one).
 tailnet_bind = "100.64.1.10"
+# Optional: MagicDNS instead of whatever the OS lists (still no Cloudflare/Google/Quad9 fallback).
+# tailnet_dns = "100.100.100.100"
 # Self-hosted iroh relay published via Tailscale Serve (non-443 ports are kept):
 relays = ["https://relay.example.ts.net:10443"]
 ```
 
 Example values only — use your own MagicDNS name and address. The daemon refuses to start if `tailnet_only` is on
-and no Tailscale interface (or `tailnet_bind`) is available. Details: [DESIGN.md](DESIGN.md#tailnet_only).
+and no Tailscale interface (or `tailnet_bind`) is available.
+
+Under `tailnet_only`, `HTTPS_PROXY` / `ALL_PROXY` are ignored for iroh relays (traffic stays on the tailnet). DNS uses
+the system resolvers (or `tailnet_dns`) with public fallbacks disabled; NetReport HTTPS latency probes and captive-portal
+checks are off (QUIC probes only hit the relays you listed). Details: [DESIGN.md](DESIGN.md#tailnet_only).
 
 To work out why connections drop or switch to a relay, `debug_log = true` (also at the top) makes the daemon write the
 networking library's events to `~/.reason/network/debug.log`, on this computer only and without message text, links

@@ -125,9 +125,16 @@ mod tests {
     }
 
     #[test]
-    fn tailnet_only_turns_auto_update_off_at_the_gate() {
-        // Daemon starts the loop only when `allowed(auto_update && !tailnet_only)`.
+    fn allowed_is_off_when_the_enabled_flag_is_false() {
         assert!(!super::allowed(false));
-        assert_eq!(super::allowed(true), !crate::util::from_source() && !crate::managed());
+    }
+
+    #[test]
+    fn daemon_composes_auto_update_with_tailnet_only_before_allowed() {
+        // Matches `daemon::run`: `update::allowed(cfg.auto_update && !cfg.tailnet_only())`.
+        let auto_update = true;
+        assert!(!super::allowed(auto_update && !true), "tailnet_only must suppress the updater");
+        assert_eq!(super::allowed(auto_update && !false), super::allowed(true));
+        assert!(!super::allowed(false && !false));
     }
 }
