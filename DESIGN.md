@@ -190,6 +190,11 @@ there says to set the same relay with `reason-network relay`.
 That is the "HTTPS and local network, MagicDNS style" requirement with one stack, and a relay as the only server
 (Reason's, or the team's own).
 
+Fork option **`tailnet_only`** (off by default; see [Config](#config)): when enabled, the endpoint uses only
+`presets::Minimal`, disables the portmapper, skips mDNS and Reason's public relay list / GitHub updater, binds solely
+on Tailscale addresses, and allows only relays listed in config (HTTPS URLs may carry an explicit non-443 port such as
+`https://relay.example.ts.net:10443`).
+
 **Roster (membership).** Replicated to every machine, every entry signed by a member machine's key:
 - *admissions*: how each machine got in (the founder's self-signed entry, then each admission signed by an
   already-admitted machine). Kept forever, so who may sign never depends on the order changes arrive in, and
@@ -542,10 +547,31 @@ Or paste the invite line into any agent.
 | `tray` | `true` | macOS: show the menu bar icon while the background service runs |
 | `lan` | `true` | find teammates on the local network (mDNS) |
 | `auto_update` | `true` | install new releases when they come out (checked every few hours) |
+| `tailnet_only` | `false` | only communicate over a Tailscale tailnet (see below); also `--tailnet-only` |
+| `relays` | none | HTTPS relay URLs allowed when `tailnet_only` is on (explicit ports kept, e.g. `https://relay.example.ts.net:10443`) |
+| `tailnet_bind` | none | optional Tailscale address to bind when `tailnet_only` is on (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`) |
 | `reason` | `false` | list your live Reason sessions (set by `reason-network setup`) |
 | `debug_log` | `false` | write the networking library's events to `debug.log`, on this computer only (read when the daemon starts) |
 | `inbound` | accept | see above |
 | `folders` | none | folders whose sessions are never shared, e.g. `"~/personal" = "off"` (`reason-network folder <path> off`, `on` undoes it) |
+
+### `tailnet_only`
+
+Off by default. When off, networking is unchanged. When on (config key or `--tailnet-only` / `REASON_NETWORK_TAILNET_ONLY`), the node:
+
+- binds UDP only on Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), never `0.0.0.0` / `::` (or on `tailnet_bind` if set); fails clearly if none are found
+- disables mDNS, n0 pkarr/DNS discovery, and the portmapper
+- uses only relays listed in `relays` (never `DEFAULT_RELAYS` or `https://reasonmachines.com/network/relays.json`); a team relay must be on that list; URLs may include a non-443 port
+- skips GitHub auto-update and the periodic relay-list fetch
+- does not call `mcp.reasonmachines.com` (this engine never did; hosted MCP stays a separate client-side setup)
+
+Example (names and addresses are fictional):
+
+```toml
+tailnet_only = true
+tailnet_bind = "100.64.1.10"
+relays = ["https://relay.example.ts.net:10443"]
+```
 
 A session in a folder that is off (by its own folder or any other its agent names, links followed) never registers:
 its tools say its user turned Reason Network off for the folder, its hooks print nothing, and its agent sends no files

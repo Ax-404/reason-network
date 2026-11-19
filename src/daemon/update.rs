@@ -1,7 +1,7 @@
 //! Keeps a standalone install up to date: every few hours the daemon looks for a newer release and, if there is one,
 //! installs it over its own binary (with install.sh, or install.ps1 on Windows, checksum verified) and restarts on it.
-//! Off with `auto_update = false`; never for builds run from a source tree, nor for the build the Reason CLI pins
-//! (in `~/.reason/bin`), which updates with the CLI.
+//! Off with `auto_update = false`, or when `tailnet_only` is on (no GitHub). Never for builds run from a source tree,
+//! nor for the build the Reason CLI pins (in `~/.reason/bin`), which updates with the CLI.
 
 use super::{Daemon, log};
 use anyhow::{Result, bail};
@@ -122,5 +122,12 @@ mod tests {
         assert!(super::newer("1.0.0", "0.99.99"));
         assert!(!super::newer("0.6.3", "0.6.3"));
         assert!(!super::newer("0.6.2", "0.6.10"));
+    }
+
+    #[test]
+    fn tailnet_only_turns_auto_update_off_at_the_gate() {
+        // Daemon starts the loop only when `allowed(auto_update && !tailnet_only)`.
+        assert!(!super::allowed(false));
+        assert_eq!(super::allowed(true), !crate::util::from_source() && !crate::managed());
     }
 }
