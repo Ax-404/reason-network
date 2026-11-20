@@ -191,8 +191,9 @@ That is the "HTTPS and local network, MagicDNS style" requirement with one stack
 (Reason's, or the team's own).
 
 Fork option **`tailnet_only`** (off by default; see [Config](#tailnet_only)): every endpoint (main, invite, probes)
-uses Minimal, Tailscale-only bind, no portmapper, system DNS without public fallbacks, minimal NetReport, no
-`HTTPS_PROXY`, and only config-listed relays (ports kept, e.g. `https://relay.example.ts.net:10443`).
+uses Minimal, Tailscale-only bind, no portmapper, system DNS without public fallbacks, NetReport with HTTPS probes
+on (captive portal off), no `HTTPS_PROXY`, and only config-listed relays (ports kept, e.g.
+`https://relay.example.ts.net:10443`).
 
 **Roster (membership).** Replicated to every machine, every entry signed by a member machine's key:
 - *admissions*: how each machine got in (the founder's self-signed entry, then each admission signed by an
