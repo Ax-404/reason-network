@@ -23,6 +23,7 @@ mod relays;
 mod render;
 mod setup;
 mod store;
+mod tailnet;
 mod team;
 mod tray;
 mod usage;
@@ -122,6 +123,9 @@ pub fn invite_line(link: &str) -> String {
     after_help = "Run it on its own to get set up, then to see who's working on what."
 )]
 struct Cli {
+    /// Only communicate over the Tailscale tailnet (see `tailnet_only` in config.toml)
+    #[arg(long, global = true)]
+    tailnet_only: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -324,7 +328,11 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     migrate::as_ours();
-    let cmd = Cli::parse().cmd;
+    let args = Cli::parse();
+    if args.tailnet_only {
+        config::enable_cli_tailnet_only();
+    }
+    let cmd = args.cmd;
     paths::migrate();
     match cmd {
         Some(Cmd::Daemon { service }) => {

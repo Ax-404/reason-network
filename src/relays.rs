@@ -113,6 +113,7 @@ fn cached(home: &Path) -> Option<List> {
 }
 
 /// The relays to use: the cached list, else the built-in default.
+#[allow(dead_code)] // kept for callers that need the cached/default list without fetching
 pub fn current() -> Vec<RelayUrl> {
     current_in(&crate::paths::home())
 }
@@ -122,9 +123,14 @@ fn current_in(home: &Path) -> Vec<RelayUrl> {
 }
 
 /// The same, fetching the list first if none is cached yet (a machine's first network start), for at most
-/// `FIRST_WAIT`.
+/// `FIRST_WAIT`. Not used under `tailnet_only` (see `net::relays_for`).
 pub async fn current_or_fetch() -> Vec<RelayUrl> {
     current_or_fetch_in(crate::paths::home(), url()).await
+}
+
+/// Whether the daemon should refresh Reason's public relay list. Always false under `tailnet_only`.
+pub fn refresh_allowed(tailnet_only: bool) -> bool {
+    !tailnet_only
 }
 
 async fn current_or_fetch_in(home: PathBuf, url: String) -> Vec<RelayUrl> {
@@ -416,6 +422,12 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--proto", "=https"]));
         assert!(args.windows(2).any(|w| w == ["--max-redirs", "0"]));
         assert!(!args.iter().any(|a| a == "-L" || a == "--location"));
+    }
+
+    #[test]
+    fn tailnet_only_refuses_to_refresh_the_public_list() {
+        assert!(refresh_allowed(false));
+        assert!(!refresh_allowed(true));
     }
 
     #[tokio::test]

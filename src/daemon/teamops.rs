@@ -91,7 +91,8 @@ impl Daemon {
         let team = self.team_state().ok_or_else(|| anyhow!("not in a team"))?;
         self.stop_net_now().await;
         let relay = team.meta.body.relay.as_deref();
-        let endpoint = net::bind(self.key.clone(), relay, self.cfg.lan(), self.cfg.port()).await?;
+        let opts = net::NetOpts::from_config(&self.cfg);
+        let endpoint = net::bind(self.key.clone(), relay, &opts).await?;
         // Last known presence of each machine, so `who --all` shows offline teammates after a restart.
         let mut remote = HashMap::new();
         {
@@ -106,7 +107,7 @@ impl Daemon {
                 }
             }
         }
-        let net = Net::start(self, endpoint, relay, remote);
+        let net = Net::start(self, endpoint, remote);
         log(&format!("team {} · machine {}", team.shown_name(), net.id().fmt_short()));
         *self.net.write().unwrap() = Some(net.clone());
         // Invite codes made here that are still good: listen for them again.
@@ -120,7 +121,7 @@ impl Daemon {
         };
         for (code, expires) in codes {
             if team.invite_unused(&invite::secret(&code)) {
-                net.listen_invite(invite::key(&code), expires, relay, self.cfg.lan()).await?;
+                net.listen_invite(invite::key(&code), expires, relay, &opts).await?;
             } else {
                 self.inner.lock().unwrap().store.delete_prefix(&format!("code:{code}"))?;
             }
@@ -248,7 +249,7 @@ impl Daemon {
             state.attest(&self.key.public(), p);
         }
         if let Some(u) = &relay {
-            net::check_relay(self.key.clone(), u).await?;
+            net::check_relay(self.key.clone(), u, &net::NetOpts::from_config(&self.cfg)).await?;
             state.set_relay(&self.key, relay.clone());
         }
         {
@@ -328,7 +329,8 @@ impl Daemon {
             }
             None => bail!("that's not an invite code (four words, like plum-tiger-lake-orbit)"),
         };
-        let (endpoint, relays) = net::bind_settled(self.key.clone(), relay.as_deref(), self.cfg.lan()).await?;
+        let (endpoint, relays) =
+            net::bind_settled(self.key.clone(), relay.as_deref(), &net::NetOpts::from_config(&self.cfg)).await?;
         let req = JoinRequest {
             team: team.clone(),
             secret,
@@ -461,7 +463,7 @@ impl Daemon {
             let ticket = ticket.encode();
             return Ok(InviteInfo { code: ticket.clone(), ticket, hours });
         }
-        net.listen_invite(invite::key(&code), expires, relay.as_deref(), self.cfg.lan()).await?;
+        net.listen_invite(invite::key(&code), expires, relay.as_deref(), &net::NetOpts::from_config(&self.cfg)).await?;
         Ok(InviteInfo { code, ticket: ticket.encode(), hours })
     }
 
@@ -664,7 +666,7 @@ impl Daemon {
 
     pub(super) async fn set_relay(self: &Arc<Self>, url: Option<String>) -> Result<String> {
         if let Some(u) = &url {
-            net::check_relay(self.key.clone(), u).await?;
+            net::check_relay(self.key.clone(), u, &net::NetOpts::from_config(&self.cfg)).await?;
         }
         let state = {
             let mut g = self.inner.lock().unwrap();

@@ -80,8 +80,10 @@ pub async fn run(service: bool) -> Result<()> {
         tokio::spawn(daemon.clone().relay_loop());
     }
     tokio::spawn(crate::migrate::run(log));
-    tokio::spawn(daemon.clone().relays_loop());
-    if update::allowed(daemon.cfg.auto_update) {
+    if !daemon.cfg.tailnet_only() {
+        tokio::spawn(daemon.clone().relays_loop());
+    }
+    if update::allowed(daemon.cfg.auto_update && !daemon.cfg.tailnet_only()) {
         tokio::spawn(daemon.clone().update_loop());
     }
     loop {
@@ -495,9 +497,12 @@ impl Daemon {
     }
 
     /// Keeps Reason's relay list fresh, unless the team runs its own relay. A new list applies at the next start.
+    /// Not started under `tailnet_only` (no fetch of reasonmachines.com).
     async fn relays_loop(self: Arc<Self>) {
         loop {
-            if self.team_state().is_none_or(|t| t.meta.body.relay.is_none()) {
+            if crate::relays::refresh_allowed(self.cfg.tailnet_only())
+                && self.team_state().is_none_or(|t| t.meta.body.relay.is_none())
+            {
                 crate::relays::refresh().await;
             }
             tokio::time::sleep(crate::relays::EVERY).await;

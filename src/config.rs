@@ -1,7 +1,19 @@
 use crate::{CLI, paths, util};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+/// Set by `--tailnet-only` for this process (config file may still be off).
+static CLI_TAILNET_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Honour the `--tailnet-only` CLI flag for every later [`Config::tailnet_only`] check in this process.
+pub fn enable_cli_tailnet_only() {
+    CLI_TAILNET_ONLY.store(true, Ordering::SeqCst);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -27,6 +39,23 @@ pub struct Config {
     pub reason: bool,
     /// Install new releases when they come out (the daemon checks every few hours).
     pub auto_update: bool,
+    /// Only communicate over a Tailscale tailnet: no mDNS, n0 discovery, portmapper, public relays, GitHub
+    /// auto-update, or other Reason Machines control-plane fetches. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tailnet_only: bool,
+    /// Relays this machine may use when [`Self::tailnet_only`] is on (HTTPS URLs; an explicit port is kept, e.g.
+    /// `https://relay.example.ts.net:10443`). Ignored when `tailnet_only` is off. Empty: no relays.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+    /// Optional Tailscale interface address to bind when [`Self::tailnet_only`] is on (must be in `100.64.0.0/10` or
+    /// `fd7a:115c:a1e0::/48`). When unset, every such address on this machine is used. On Windows, set this: interface
+    /// auto-detection is not implemented there. Ignored when `tailnet_only` is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet_bind: Option<String>,
+    /// Optional DNS nameserver IP when [`Self::tailnet_only`] is on (e.g. Tailscale MagicDNS `100.100.100.100`). When
+    /// unset, the host's system resolvers are used with public fallbacks disabled. Ignored when `tailnet_only` is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet_dns: Option<String>,
     /// The UDP port teammates reach this machine on directly, e.g. `41641` for a firewall or router rule. None: a
     /// random one each start. Taken by something else, a random one is used.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,6 +110,10 @@ impl Default for Config {
             tray: true,
             reason: false,
             auto_update: true,
+            tailnet_only: false,
+            relays: Vec::new(),
+            tailnet_bind: None,
+            tailnet_dns: None,
             port: None,
             debug_log: false,
             inbound: Inbound::default(),
@@ -150,7 +183,8 @@ impl Config {
     }
 
     fn read_private(text: &str) -> Self {
-        if let Ok(cfg) = toml::from_str(text) {
+        if let Ok(mut cfg) = toml::from_str::<Self>(text) {
+            cfg.apply_tailnet_validation();
             return cfg;
         }
         let table = match text.parse::<toml::Table>() {
@@ -176,6 +210,10 @@ impl Config {
         key!(tray, false);
         key!(reason, false);
         key!(auto_update, true);
+        key!(tailnet_only, false);
+        key!(relays, Vec::new());
+        key!(tailnet_bind, None);
+        key!(tailnet_dns, None);
         key!(port, None);
         key!(debug_log, false);
         if let Some(value) = table.get("folders") {
@@ -228,16 +266,58 @@ impl Config {
             cfg.lan = false;
             cfg.unreadable = Some(errors.join("; "));
         }
+        cfg.apply_tailnet_validation();
         cfg
     }
 
     /// Like `load`, but a file that doesn't parse is an error (before rewriting it, say).
     pub fn load_strict() -> Result<Self> {
         match std::fs::read_to_string(paths::config()) {
-            Ok(s) => Ok(toml::from_str(&s)?),
+            Ok(s) => {
+                let cfg: Self = toml::from_str(&s)?;
+                if let Some(error) = cfg.tailnet_field_errors() {
+                    anyhow::bail!(error);
+                }
+                Ok(cfg)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// When `tailnet_only` is set in the file, check `relays`, `tailnet_bind`, and `tailnet_dns` early.
+    fn apply_tailnet_validation(&mut self) {
+        if let Some(error) = self.tailnet_field_errors() {
+            self.lan = false;
+            self.unreadable = Some(match self.unreadable.take() {
+                Some(prior) => format!("{prior}; {error}"),
+                None => error,
+            });
+        }
+    }
+
+    /// Problems with `tailnet_only` fields, if that flag is on in the file (not via CLI alone).
+    fn tailnet_field_errors(&self) -> Option<String> {
+        if !self.tailnet_only {
+            return None;
+        }
+        let mut errors = Vec::new();
+        for url in &self.relays {
+            if let Err(e) = crate::net::parse_https_relay_url(url) {
+                errors.push(format!("relays: {e:#}"));
+            }
+        }
+        if let Some(bind) = self.tailnet_bind.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && let Err(e) = crate::tailnet::parse_bind_ip(bind)
+        {
+            errors.push(format!("tailnet_bind: {e:#}"));
+        }
+        if let Some(dns) = self.tailnet_dns.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && dns.parse::<std::net::IpAddr>().is_err()
+        {
+            errors.push(format!("tailnet_dns is not an IP address: {dns}"));
+        }
+        (!errors.is_empty()).then(|| errors.join("; "))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -263,7 +343,14 @@ impl Config {
     }
 
     pub fn lan(&self) -> bool {
-        self.lan && crate::paths::env_var_os("NO_MDNS").is_none()
+        !self.tailnet_only() && self.lan && crate::paths::env_var_os("NO_MDNS").is_none()
+    }
+
+    /// Whether this process must stay on the Tailscale tailnet only.
+    pub fn tailnet_only(&self) -> bool {
+        self.tailnet_only
+            || CLI_TAILNET_ONLY.load(Ordering::SeqCst)
+            || crate::paths::env_var_os("TAILNET_ONLY").is_some()
     }
 
     /// The fixed UDP port, if one is set; `0` (any port) is the same as none.
@@ -704,6 +791,50 @@ bob = false
         for bad in ["port = 70000", "port = -1", "port = \"41641\""] {
             assert!(toml::from_str::<Config>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn tailnet_only_defaults_off_and_leaves_other_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.tailnet_only);
+        assert!(!cfg.tailnet_only());
+        assert!(cfg.lan());
+        assert!(cfg.auto_update);
+        assert!(cfg.relays.is_empty());
+        assert!(cfg.tailnet_bind.is_none());
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!text.contains("tailnet_only"), "off: not written");
+        assert!(!text.contains("relays"), "empty: not written");
+        let parsed = Config::read_private("");
+        assert!(!parsed.tailnet_only() && parsed.relays.is_empty());
+    }
+
+    #[test]
+    fn tailnet_only_reads_relays_with_explicit_ports() {
+        let cfg = Config::read_private(
+            r#"
+tailnet_only = true
+tailnet_bind = "100.64.1.10"
+tailnet_dns = "100.100.100.100"
+relays = ["https://relay.example.ts.net:10443", "https://relay-b.example.ts.net:8443"]
+"#,
+        );
+        assert!(cfg.tailnet_only());
+        assert!(cfg.warning().is_none());
+        assert!(!cfg.lan(), "mDNS off while tailnet_only");
+        assert_eq!(cfg.tailnet_bind.as_deref(), Some("100.64.1.10"));
+        assert_eq!(cfg.tailnet_dns.as_deref(), Some("100.100.100.100"));
+        assert_eq!(cfg.relays, ["https://relay.example.ts.net:10443", "https://relay-b.example.ts.net:8443"]);
+    }
+
+    #[test]
+    fn tailnet_only_rejects_bad_relays_and_bind_at_load() {
+        let bad_relay = Config::read_private("tailnet_only = true\nrelays = [\"http://relay.example.ts.net:10443\"]\n");
+        assert!(bad_relay.warning().is_some_and(|w| w.contains("relays")), "{:?}", bad_relay.warning());
+        let bad_bind = Config::read_private("tailnet_only = true\ntailnet_bind = \"127.0.0.1\"\n");
+        assert!(bad_bind.warning().is_some_and(|w| w.contains("tailnet_bind")), "{:?}", bad_bind.warning());
+        let bad_dns = Config::read_private("tailnet_only = true\ntailnet_dns = \"not-an-ip\"\n");
+        assert!(bad_dns.warning().is_some_and(|w| w.contains("tailnet_dns")), "{:?}", bad_dns.warning());
     }
 
     fn temp() -> std::path::PathBuf {

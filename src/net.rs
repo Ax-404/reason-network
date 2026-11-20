@@ -13,14 +13,18 @@ use futures_lite::{StreamExt, stream::Boxed};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher,
     address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item},
-    endpoint::{Builder, ConnectError, ConnectWithOptsError, Connection, RecvStream, SendStream, presets},
+    dns::{DnsResolver, NameserverConfig},
+    endpoint::{
+        Builder, ConnectError, ConnectWithOptsError, Connection, NetReportConfig, PortmapperConfig, RecvStream,
+        SendStream, presets,
+    },
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{HashMap, HashSet},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
@@ -43,6 +47,121 @@ pub const DEFAULT_RELAYS: &[&str] = &["https://relay-sfo1.compute.reasonmachines
 
 pub fn default_relays() -> Vec<RelayUrl> {
     DEFAULT_RELAYS.iter().map(|u| u.parse().expect("default relays are urls")).collect()
+}
+
+/// How an endpoint is built: LAN discovery, fixed UDP port, and optional Tailscale-only lockdown.
+#[derive(Debug, Clone, Default)]
+pub struct NetOpts {
+    pub lan: bool,
+    pub port: Option<u16>,
+    pub tailnet_only: bool,
+    /// Allowed relays when `tailnet_only` (HTTPS; explicit ports kept). Ignored otherwise.
+    pub allowed_relays: Vec<String>,
+    /// Optional Tailscale bind address when `tailnet_only`. Ignored otherwise.
+    pub tailnet_bind: Option<String>,
+    /// Optional DNS nameserver when `tailnet_only` (e.g. MagicDNS `100.100.100.100`). None: system resolvers only,
+    /// with public fallbacks disabled. Ignored otherwise.
+    pub tailnet_dns: Option<String>,
+}
+
+impl NetOpts {
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        Self {
+            lan: cfg.lan(),
+            port: cfg.port(),
+            tailnet_only: cfg.tailnet_only(),
+            allowed_relays: cfg.relays.clone(),
+            tailnet_bind: cfg.tailnet_bind.clone(),
+            tailnet_dns: cfg.tailnet_dns.clone(),
+        }
+    }
+
+    /// Plain LAN/port options (tests and paths that never enable `tailnet_only`).
+    #[cfg(test)]
+    pub fn plain(lan: bool, port: Option<u16>) -> Self {
+        Self { lan, port, ..Self::default() }
+    }
+
+    /// Same lockdown as this endpoint, but for a throwaway probe (no mDNS, no fixed port).
+    pub fn for_probe(&self) -> Self {
+        Self { lan: false, port: None, ..self.clone() }
+    }
+}
+
+/// Lockdown knobs applied to every iroh endpoint built from [`NetOpts`] (main, invite listener, `route_loop` /
+/// `reaches` probes, `check_relay`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointPlan {
+    pub minimal_preset: bool,
+    pub portmapper_disabled: bool,
+    /// Use [`tailnet_net_report_config`]: captive portal off, HTTPS probes on (TCP-only relays).
+    pub net_report_tailnet: bool,
+    pub dns_no_public_fallback: bool,
+    pub bind_tailnet_only: bool,
+    pub ignore_http_proxy: bool,
+}
+
+impl EndpointPlan {
+    pub fn for_opts(opts: &NetOpts, own: bool) -> Self {
+        if opts.tailnet_only {
+            Self {
+                minimal_preset: true,
+                portmapper_disabled: true,
+                net_report_tailnet: true,
+                dns_no_public_fallback: true,
+                bind_tailnet_only: true,
+                ignore_http_proxy: true,
+            }
+        } else {
+            Self {
+                minimal_preset: own,
+                portmapper_disabled: false,
+                net_report_tailnet: false,
+                dns_no_public_fallback: false,
+                bind_tailnet_only: false,
+                ignore_http_proxy: false,
+            }
+        }
+    }
+}
+
+/// NetReport under `tailnet_only`: keep captive-portal checks off, but leave HTTPS latency probes on.
+///
+/// A TCP-only `iroh-relay` (typical behind Tailscale Serve without QUIC) is never selected when
+/// `https_probes` is false — `preferred_relay` stays `None` and `init --relay` fails with "couldn't
+/// reach relay" (iroh 1.4.1). Those probes issue an empty HTTPS GET to each relay in this endpoint's
+/// `RelayMap` only (the URLs from `RelayMode::custom` / config `relays`), not to public Reason or n0
+/// relays. Captive-portal GETs to `/generate_204` stay disabled.
+pub fn tailnet_net_report_config() -> NetReportConfig {
+    let mut nr = NetReportConfig::minimal();
+    nr.https_probes = true;
+    nr
+}
+
+/// Parse a relay URL the way non-`tailnet_only` paths always did (scheme not forced).
+pub fn parse_relay_url(url: &str) -> Result<RelayUrl> {
+    url.parse().map_err(|_| anyhow!("not a relay url: {url} (expected e.g. https://relay.example.com)"))
+}
+
+/// HTTPS relay URL for `tailnet_only` allow-lists; an explicit port is kept (e.g. `https://relay.example.ts.net:10443`).
+pub fn parse_https_relay_url(url: &str) -> Result<RelayUrl> {
+    let url = parse_relay_url(url)?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        bail!("not an https relay: {url}");
+    }
+    Ok(url)
+}
+
+/// DNS for `tailnet_only`: system resolvers (or one optional nameserver), never Cloudflare/Google/Quad9 fallbacks.
+pub fn tailnet_dns_resolver(nameserver: Option<&str>) -> Result<DnsResolver> {
+    let mut b = DnsResolver::builder().disable_fallback();
+    if let Some(raw) = nameserver.map(str::trim).filter(|s| !s.is_empty()) {
+        let ip: IpAddr = raw.parse().map_err(|_| anyhow!("tailnet_dns is not an IP address: {raw}"))?;
+        b = b.add_nameserver_config(NameserverConfig::udp(ip));
+    } else {
+        b = b.with_system_defaults();
+    }
+    Ok(b.build())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +268,8 @@ pub struct Net {
     /// The proxy's address as looked up for the endpoint.
     at: Option<RelayUrl>,
     udp: UdpPort,
+    /// Options this network (and every secondary endpoint it spawns) was built with.
+    opts: NetOpts,
     router: Mutex<Option<Router>>,
     /// Endpoints listening for joins on behalf of invite codes, by their (code-derived) id.
     invites: Mutex<HashMap<EndpointId, Router>>,
@@ -169,13 +290,33 @@ const FIRST_WAY: Duration = Duration::from_secs(5);
 const OTHER_WAY: Duration = Duration::from_secs(10);
 
 /// The relays an endpoint uses: the team's own (`relay`), or the default ones (fetching the list on a first start).
-pub async fn relays_for(relay: Option<&str>) -> Result<Vec<RelayUrl>> {
+/// With `tailnet_only`, only explicitly configured relays are used (never Reason's public list or `DEFAULT_RELAYS`).
+pub async fn relays_for(relay: Option<&str>, opts: &NetOpts) -> Result<Vec<RelayUrl>> {
+    if opts.tailnet_only {
+        return tailnet_relays(relay, &opts.allowed_relays);
+    }
     Ok(match relay {
         None => crate::relays::current_or_fetch().await,
-        Some(url) => {
-            vec![url.parse().map_err(|_| anyhow!("not a relay url: {url} (expected e.g. https://relay.example.com)"))?]
-        }
+        Some(url) => vec![parse_relay_url(url)?],
     })
+}
+
+/// Relays allowed under `tailnet_only`: only those listed in config. A team relay must be among them.
+fn tailnet_relays(team_relay: Option<&str>, allowed: &[String]) -> Result<Vec<RelayUrl>> {
+    let allowed: Vec<RelayUrl> = allowed.iter().map(|u| parse_https_relay_url(u)).collect::<Result<_>>()?;
+    match team_relay {
+        None => Ok(allowed),
+        Some(url) => {
+            let want = parse_https_relay_url(url)?;
+            if !allowed.iter().any(|a| a == &want) {
+                bail!(
+                    "tailnet_only: team relay {url} is not in config relays \
+                     (list it explicitly, e.g. relays = [\"https://relay.example.ts.net:10443\"])"
+                );
+            }
+            Ok(vec![want])
+        }
+    }
 }
 
 /// The relays last reached through the proxy, one per line: those are tried that way first.
@@ -196,8 +337,12 @@ fn proxied(file: &std::path::Path, relays: &[RelayUrl]) -> bool {
 
 /// The proxy to reach `relays` through: one is set (see [`proxy_for`]) and it is what last got through to them.
 /// Otherwise relays are reached directly, as without a proxy: a proxy variable can be stale (a VPN's, a debugging
-/// proxy's) while the internet is right there.
-fn route(relays: &[RelayUrl]) -> Option<RelayUrl> {
+/// proxy's) while the internet is right there. Under `tailnet_only`, always none: relays are on the tailnet, and
+/// `HTTPS_PROXY` must not pull traffic off it.
+fn route(relays: &[RelayUrl], opts: &NetOpts) -> Option<RelayUrl> {
+    if opts.tailnet_only {
+        return None;
+    }
     proxied(&route_file(), relays).then(|| proxy_for(relays)).flatten()
 }
 
@@ -225,6 +370,10 @@ fn keep_in(file: &std::path::Path, proxied: bool, relays: &[RelayUrl]) -> std::i
 /// looked up for it.
 pub struct Bound {
     pub endpoint: Endpoint,
+    /// Relays this endpoint was built with (config allow-list under `tailnet_only`, else team/default).
+    pub relays: Vec<RelayUrl>,
+    /// Options this endpoint was built with (inherited by probes and invite listeners).
+    pub opts: NetOpts,
     proxy: Option<RelayUrl>,
     at: Option<RelayUrl>,
     udp: UdpPort,
@@ -233,39 +382,45 @@ pub struct Bound {
 /// An endpoint on the team's own relay (`relay`) or the default ones, the way that last got through, at once. A
 /// running network that stays off its relays tries the other way itself (see `route_loop`). On UDP `port` if one is
 /// set and free (the network's own endpoint; anything else would take it from that one).
-pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool, port: Option<u16>) -> Result<Bound> {
-    let relays = relays_for(relay).await?;
-    endpoint(&key, &relays, relay.is_some(), lan, route(&relays), port).await
+pub async fn bind(key: SecretKey, relay: Option<&str>, opts: &NetOpts) -> Result<Bound> {
+    let relays = relays_for(relay, opts).await?;
+    // Own relay, or tailnet_only: never n0 discovery / public defaults.
+    let own = relay.is_some() || opts.tailnet_only;
+    endpoint(&key, &relays, own, opts, route(&relays, opts)).await
 }
 
 /// The same, for something a person waits on anyway (a join, checking a relay): if no relay answers the usual way
 /// and a proxy is set, the other way is tried, and kept if it gets through. Also the relays, for what to say if not.
-pub async fn bind_settled(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<(Endpoint, Vec<RelayUrl>)> {
-    let relays = relays_for(relay).await?;
-    let own = relay.is_some();
-    let first = route(&relays);
-    let endpoint = self::endpoint(&key, &relays, own, lan, first.clone(), None).await?.endpoint;
+pub async fn bind_settled(key: SecretKey, relay: Option<&str>, opts: &NetOpts) -> Result<(Endpoint, Vec<RelayUrl>)> {
+    let relays = relays_for(relay, opts).await?;
+    let own = relay.is_some() || opts.tailnet_only;
+    let first = route(&relays, opts);
+    let endpoint = self::endpoint(&key, &relays, own, opts, first.clone()).await?.endpoint;
+    if opts.tailnet_only {
+        return Ok((endpoint, relays));
+    }
     let Some(proxy) = proxy_for(&relays) else { return Ok((endpoint, relays)) };
     if tokio::time::timeout(FIRST_WAY, endpoint.online()).await.is_ok() {
         return Ok((endpoint, relays));
     }
     let other = if first.is_some() { None } else { Some(proxy) };
     log(&format!("no relay {} ({}): trying {}", way(&first), unreached(&endpoint), way(&other)));
-    if !reaches(&relays, &other).await {
+    if !reaches(&relays, &other, opts).await {
         log(&format!("no relay {} either", way(&other)));
         return Ok((endpoint, relays));
     }
     endpoint.close().await;
     keep_route(&other, &relays);
     log(&format!("on a relay {}", way(&other)));
-    Ok((self::endpoint(&key, &relays, own, lan, other, None).await?.endpoint, relays))
+    Ok((self::endpoint(&key, &relays, own, opts, other).await?.endpoint, relays))
 }
 
 /// Whether a relay answers the `proxy` way, asked by a throwaway endpoint that publishes nothing (this machine's own
-/// stays as it is).
-async fn reaches(relays: &[RelayUrl], proxy: &Option<RelayUrl>) -> bool {
+/// stays as it is). The probe inherits the caller's [`NetOpts`] (including full `tailnet_only` lockdown).
+async fn reaches(relays: &[RelayUrl], proxy: &Option<RelayUrl>, opts: &NetOpts) -> bool {
+    let probe_opts = opts.for_probe();
     let Ok(Bound { endpoint: probe, .. }) =
-        endpoint(&SecretKey::generate(), relays, true, false, proxy.clone(), None).await
+        endpoint(&SecretKey::generate(), relays, true, &probe_opts, proxy.clone()).await
     else {
         return false;
     };
@@ -278,10 +433,15 @@ async fn endpoint(
     key: &SecretKey,
     relays: &[RelayUrl],
     own: bool,
-    lan: bool,
+    opts: &NetOpts,
     proxy: Option<RelayUrl>,
-    port: Option<u16>,
 ) -> Result<Bound> {
+    let plan = EndpointPlan::for_opts(opts, own);
+    let port = opts.port;
+    let lan = opts.lan && !plan.bind_tailnet_only;
+    let tailnet_ips =
+        if plan.bind_tailnet_only { Some(crate::tailnet::bind_ips(opts.tailnet_bind.as_deref())?) } else { None };
+    let proxy = if plan.ignore_http_proxy { None } else { proxy };
     let at = match &proxy {
         Some(p) => Some(looked_up(p.clone()).await),
         None => None,
@@ -289,11 +449,25 @@ async fn endpoint(
     // The default relays, with n0's address lookup still: that is how a teammate on an older Reason Network (on n0's
     // relays) and this machine find each other, and what four-word codes need. The team's own relay and nothing of
     // n0's: none of its relays, no publishing or looking up addresses in its DNS; teammates are dialed through it.
+    // `tailnet_only` always uses Minimal (no pkarr/DNS), disables the portmapper, keeps NetReport HTTPS probes on
+    // (needed for TCP-only relays) with captive-portal checks off, uses system DNS without public fallbacks, skips
+    // mDNS/HTTPS_PROXY, and binds only on the Tailscale interface (never 0.0.0.0 / ::). The same plan applies to every
+    // secondary endpoint (invite, route_loop probe, check_relay).
     let builder = || -> Result<Builder> {
-        let relay_mode = RelayMode::custom(relays.to_vec());
-        let mut b = if own { Endpoint::builder(presets::Minimal) } else { Endpoint::builder(presets::N0) }
-            .secret_key(key.clone())
-            .relay_mode(relay_mode);
+        let relay_mode = if relays.is_empty() { RelayMode::Disabled } else { RelayMode::custom(relays.to_vec()) };
+        let mut b =
+            if plan.minimal_preset { Endpoint::builder(presets::Minimal) } else { Endpoint::builder(presets::N0) }
+                .secret_key(key.clone())
+                .relay_mode(relay_mode);
+        if plan.portmapper_disabled {
+            b = b.portmapper_config(PortmapperConfig::Disabled);
+        }
+        if plan.net_report_tailnet {
+            b = b.net_report_config(tailnet_net_report_config());
+        }
+        if plan.dns_no_public_fallback {
+            b = b.dns_resolver(tailnet_dns_resolver(opts.tailnet_dns.as_deref())?);
+        }
         if let Some(at) = &at {
             b = b.proxy_url(at.clone().into());
         }
@@ -307,14 +481,22 @@ async fn endpoint(
     let fixed = match port {
         Some(p) => {
             // IPv6 that works here at all gets the port too, else (taken, refused) a random port on both, as without
-            // one: neither no network nor no IPv6.
-            let v6 = ipv6_works();
-            if !v6 {
-                log(&format!("no IPv6 here: UDP port {p} on IPv4 only"));
-            }
-            match on_port(builder()?, p, v6)?.bind().await {
+            // one: neither no network nor no IPv6. Under tailnet_only, only Tailscale addresses are bound.
+            let prepared = if let Some(ips) = &tailnet_ips {
+                on_tailnet(builder()?, ips, p)
+            } else {
+                let v6 = ipv6_works();
+                if !v6 {
+                    log(&format!("no IPv6 here: UDP port {p} on IPv4 only"));
+                }
+                on_port(builder()?, p, v6)
+            };
+            match prepared?.bind().await {
                 Ok(e) => Some(e),
                 Err(e) => {
+                    if opts.tailnet_only {
+                        return Err(anyhow!("couldn't bind UDP port {p} on the Tailscale interface: {e:#}"));
+                    }
                     log(&format!("couldn't bind UDP port {p} ({e:#}): using a random one"));
                     None
                 }
@@ -325,15 +507,47 @@ async fn endpoint(
     let fell_back = port.is_some() && fixed.is_none();
     let endpoint = match fixed {
         Some(e) => e,
-        None => builder()?.bind().await?,
+        None => {
+            // Without a fixed port, leave iroh's default binds unless tailnet_only replaces them.
+            if let Some(ips) = &tailnet_ips {
+                on_tailnet(builder()?, ips, 0)?.bind().await?
+            } else {
+                builder()?.bind().await?
+            }
+        }
     };
-    Ok(Bound { udp: UdpPort { port: udp_port(&endpoint), fixed: port, fell_back }, endpoint, proxy, at })
+    if plan.bind_tailnet_only {
+        let socks = endpoint.bound_sockets();
+        if socks.iter().any(|a| a.ip().is_unspecified()) {
+            bail!("tailnet_only: refused to listen on an unspecified address ({socks:?})");
+        }
+        if socks.iter().any(|a| !crate::tailnet::is_tailscale_ip(a.ip())) {
+            bail!("tailnet_only: bound off the Tailscale ranges ({socks:?})");
+        }
+    }
+    Ok(Bound {
+        udp: UdpPort { port: udp_port(&endpoint), fixed: port, fell_back },
+        endpoint,
+        relays: relays.to_vec(),
+        opts: opts.clone(),
+        proxy,
+        at,
+    })
 }
 
 /// `b`, on UDP `port` on IPv4, and IPv6 if `v6`, in place of a random port.
 fn on_port(b: Builder, port: u16, v6: bool) -> Result<Builder> {
     let b = b.bind_addr((Ipv4Addr::UNSPECIFIED, port))?;
     Ok(if v6 { b.bind_addr((Ipv6Addr::UNSPECIFIED, port))? } else { b })
+}
+
+/// Bind only on Tailscale addresses (never `0.0.0.0` / `::`).
+fn on_tailnet(mut b: Builder, ips: &[IpAddr], port: u16) -> Result<Builder> {
+    b = b.clear_ip_transports();
+    for ip in ips {
+        b = b.bind_addr(SocketAddr::new(*ip, port))?;
+    }
+    Ok(b)
 }
 
 /// Whether this machine can open an IPv6 UDP socket at all.
@@ -380,8 +594,8 @@ fn way(proxy: &Option<RelayUrl>) -> String {
 
 /// Makes sure this machine reaches `url` as a relay. Nothing falls back to n0's, so a mistyped or unreachable relay
 /// would cut the team off.
-pub async fn check_relay(key: SecretKey, url: &str) -> Result<()> {
-    let (endpoint, relays) = bind_settled(key, Some(url), false).await?;
+pub async fn check_relay(key: SecretKey, url: &str, opts: &NetOpts) -> Result<()> {
+    let (endpoint, relays) = bind_settled(key, Some(url), opts).await?;
     let reached = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await.is_ok();
     let why = off_relay(&endpoint, &relays);
     endpoint.close().await;
@@ -469,7 +683,9 @@ async fn route_loop(net: Weak<Net>) {
         if this.endpoint.is_closed() {
             return;
         }
-        let Some(proxy) = proxy_for(&this.relays).filter(|_| !on()) else {
+        // Under tailnet_only, never probe via HTTPS_PROXY or plain NetOpts: secondary endpoints must inherit
+        // the same lockdown (Tailscale bind, Minimal, portmapper/NetReport/DNS).
+        let Some(proxy) = proxy_for(&this.relays).filter(|_| !on() && !this.opts.tailnet_only) else {
             wait = FIRST_WAY;
             continue;
         };
@@ -478,14 +694,15 @@ async fn route_loop(net: Weak<Net>) {
             Some(p) => Some(looked_up(p.clone()).await).filter(|at| Some(at) != this.at.as_ref()),
             None => None,
         };
+        let probe = this.opts.for_probe();
         let (other, note) = match fresh {
-            Some(at) if reaches(&this.relays, &Some(at.clone())).await => {
+            Some(at) if reaches(&this.relays, &Some(at.clone()), &probe).await => {
                 (this.proxy.clone(), format!("{}, looked up again", way(&Some(at))))
             }
             _ => {
                 let other = if this.proxy.is_some() { None } else { Some(proxy) };
                 let note = way(&other);
-                if !reaches(&this.relays, &other).await {
+                if !reaches(&this.relays, &other, &probe).await {
                     wait = (wait * 2).min(Duration::from_secs(60));
                     continue;
                 }
@@ -782,14 +999,8 @@ impl ProtocolHandler for JoinProto {
 }
 
 impl Net {
-    pub fn start(
-        daemon: &Arc<Daemon>,
-        bound: Bound,
-        relay: Option<&str>,
-        remote: HashMap<EndpointId, Remote>,
-    ) -> Arc<Net> {
-        let relays: Vec<RelayUrl> = relay.map_or_else(crate::relays::current, |u| u.parse().into_iter().collect());
-        let Bound { endpoint, proxy, at, udp } = bound;
+    pub fn start(daemon: &Arc<Daemon>, bound: Bound, remote: HashMap<EndpointId, Remote>) -> Arc<Net> {
+        let Bound { endpoint, relays, proxy, at, udp, opts } = bound;
         let net = Arc::new_cyclic(|weak: &Weak<Net>| Net {
             me: endpoint.id(),
             router: Mutex::new(Some(
@@ -804,6 +1015,7 @@ impl Net {
             proxy,
             at,
             udp,
+            opts,
             daemon: Arc::downgrade(daemon),
             links: Default::default(),
             // Saved by an older build, maybe, which tidied less.
@@ -862,9 +1074,9 @@ impl Net {
         key: SecretKey,
         expires: i64,
         relay: Option<&str>,
-        lan: bool,
+        opts: &NetOpts,
     ) -> Result<()> {
-        let endpoint = bind(key, relay, lan, None).await?.endpoint;
+        let endpoint = bind(key, relay, &NetOpts { port: None, ..opts.clone() }).await?.endpoint;
         let id = endpoint.id();
         let router = Router::builder(endpoint).accept(JOIN_ALPN, JoinProto(Arc::downgrade(self), Some(id))).spawn();
         self.invites.lock().unwrap().insert(id, router);
@@ -1403,7 +1615,8 @@ mod tests {
     #[tokio::test]
     async fn a_link_naming_only_this_machine_says_so() {
         let key = SecretKey::generate();
-        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false, None).await.unwrap().endpoint;
+        let endpoint =
+            bind(key.clone(), Some("https://relay.example.com"), &NetOpts::plain(false, None)).await.unwrap().endpoint;
         let req = JoinRequest {
             team: String::new(),
             secret: String::new(),
@@ -1422,7 +1635,8 @@ mod tests {
     #[tokio::test]
     async fn a_link_naming_this_machine_and_offline_ones_says_to_ask_an_online_teammate() {
         let key = SecretKey::generate();
-        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false, None).await.unwrap().endpoint;
+        let endpoint =
+            bind(key.clone(), Some("https://relay.example.com"), &NetOpts::plain(false, None)).await.unwrap().endpoint;
         let req = JoinRequest {
             team: String::new(),
             secret: String::new(),
@@ -1444,7 +1658,7 @@ mod tests {
     async fn a_fixed_port_is_used_and_a_taken_one_falls_back_to_a_random_one() {
         let relay = Some("https://relay.example.com");
         let free = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap().local_addr().unwrap().port();
-        let b = bind(SecretKey::generate(), relay, false, Some(free)).await.unwrap();
+        let b = bind(SecretKey::generate(), relay, &NetOpts::plain(false, Some(free))).await.unwrap();
         assert_eq!(b.udp, UdpPort { port: free, fixed: Some(free), fell_back: false });
         assert!(b.endpoint.bound_sockets().iter().all(|a| a.port() == free), "{:?}", b.endpoint.bound_sockets());
         assert_eq!(b.endpoint.bound_sockets().iter().any(|a| a.is_ipv6()), ipv6_works());
@@ -1452,11 +1666,11 @@ mod tests {
         // Something else holds it: the network still starts, on a random port, and says what it wanted.
         let taken = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = taken.local_addr().unwrap().port();
-        let b = bind(SecretKey::generate(), relay, false, Some(port)).await.unwrap();
+        let b = bind(SecretKey::generate(), relay, &NetOpts::plain(false, Some(port))).await.unwrap();
         assert!(b.udp.port != port && b.udp.port != 0 && b.udp.fixed == Some(port) && b.udp.fell_back, "{:?}", b.udp);
         b.endpoint.close().await;
         // None set: random, as before.
-        let b = bind(SecretKey::generate(), relay, false, None).await.unwrap();
+        let b = bind(SecretKey::generate(), relay, &NetOpts::plain(false, None)).await.unwrap();
         assert!(b.udp.port != 0 && b.udp.fixed.is_none() && !b.udp.fell_back);
         b.endpoint.close().await;
     }
@@ -1471,7 +1685,9 @@ mod tests {
         let port = taken.local_addr().unwrap().port();
         // IPv4 has it free (else the case isn't the one under test).
         drop(std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).expect("IPv4 side free"));
-        let b = bind(SecretKey::generate(), Some("https://relay.example.com"), false, Some(port)).await.unwrap();
+        let b = bind(SecretKey::generate(), Some("https://relay.example.com"), &NetOpts::plain(false, Some(port)))
+            .await
+            .unwrap();
         let socks = b.endpoint.bound_sockets();
         assert!(b.udp.fell_back && b.udp.port != port && b.udp.fixed == Some(port), "{:?}", b.udp);
         assert!(socks.iter().any(|a| a.is_ipv6()) && socks.iter().all(|a| a.port() != port), "{socks:?}");
@@ -1575,5 +1791,130 @@ mod tests {
         // Kept names are names like any other a teammate's machine sends.
         let p = tidy_presence(Presence { kept: vec!["<API Claude>".into(), "!!".into()], ..Default::default() });
         assert_eq!(p.kept, ["api-claude"]);
+    }
+
+    #[test]
+    fn relay_urls_keep_an_explicit_non_standard_https_port() {
+        // Self-hosted relays published via Tailscale Serve often listen on a port other than 443.
+        let url = "https://relay.example.ts.net:10443";
+        let parsed = parse_https_relay_url(url).unwrap();
+        assert_eq!(parsed.port(), Some(10443));
+        assert_eq!(parsed.port_or_known_default(), Some(10443));
+        assert_eq!(parsed.host_str(), Some("relay.example.ts.net"));
+        assert!(parsed.as_str().contains(":10443"), "{}", parsed.as_str());
+        let mode = RelayMode::custom(vec![parsed.clone()]);
+        let urls: Vec<RelayUrl> = mode.relay_map().urls();
+        assert_eq!(urls, [parsed]);
+        assert_eq!(urls[0].port(), Some(10443));
+    }
+
+    #[test]
+    fn parse_relay_url_without_tailnet_only_keeps_the_original_loose_parse() {
+        // Historical behaviour when the option is off: any parseable URL, scheme not forced to https.
+        let http = parse_relay_url("http://relay.example.com").unwrap();
+        assert_eq!(http.scheme(), "http");
+        assert!(parse_https_relay_url("http://relay.example.com").is_err());
+        let https = parse_relay_url("https://relay.example.com:8443").unwrap();
+        assert_eq!(https.port(), Some(8443));
+    }
+
+    #[test]
+    fn every_tailnet_endpoint_plan_locks_down_bind_portmapper_dns_and_probes() {
+        let opts = NetOpts {
+            tailnet_only: true,
+            allowed_relays: vec!["https://relay.example.ts.net:10443".into()],
+            tailnet_bind: Some("100.64.1.10".into()),
+            ..NetOpts::default()
+        };
+        // Main network, invite listener (own), and route_loop / reaches probes (own throwaway) all share this plan.
+        for own in [false, true] {
+            let plan = EndpointPlan::for_opts(&opts, own);
+            assert!(plan.minimal_preset, "own={own}");
+            assert!(plan.portmapper_disabled, "own={own}");
+            assert!(plan.net_report_tailnet, "own={own}");
+            assert!(plan.dns_no_public_fallback, "own={own}");
+            assert!(plan.bind_tailnet_only, "own={own}");
+            assert!(plan.ignore_http_proxy, "own={own}");
+        }
+        let probe = opts.for_probe();
+        assert!(probe.tailnet_only && !probe.lan && probe.port.is_none());
+        assert!(EndpointPlan::for_opts(&probe, true).bind_tailnet_only);
+        // Off: unchanged defaults (N0 when not own, portmapper/NetReport/DNS as iroh ships them).
+        let off = EndpointPlan::for_opts(&NetOpts::plain(true, None), false);
+        assert!(!off.minimal_preset);
+        assert!(!off.portmapper_disabled);
+        assert!(!off.net_report_tailnet);
+        assert!(!off.dns_no_public_fallback);
+        assert!(!off.bind_tailnet_only);
+        assert!(!off.ignore_http_proxy);
+        let own_off = EndpointPlan::for_opts(&NetOpts::plain(false, None), true);
+        assert!(own_off.minimal_preset);
+        assert!(!own_off.portmapper_disabled);
+    }
+
+    #[test]
+    fn tailnet_net_report_keeps_https_probes_for_tcp_only_relays() {
+        let nr = tailnet_net_report_config();
+        assert!(nr.https_probes, "TCP-only relays need HTTPS probes or preferred_relay stays None");
+        assert!(!nr.captive_portal_check, "captive-portal GETs stay off under tailnet_only");
+        let bare = NetReportConfig::minimal();
+        assert!(!bare.https_probes && !bare.captive_portal_check);
+    }
+
+    #[test]
+    fn tailnet_dns_resolver_builds_without_public_fallback() {
+        // Building succeeds with system-only (no Cloudflare/Google/Quad9 tier) and with an explicit MagicDNS IP.
+        tailnet_dns_resolver(None).unwrap();
+        tailnet_dns_resolver(Some("100.100.100.100")).unwrap();
+        assert!(tailnet_dns_resolver(Some("not-an-ip")).is_err());
+    }
+
+    #[tokio::test]
+    async fn tailnet_only_uses_only_configured_relays_and_keeps_their_ports() {
+        let opts = NetOpts {
+            tailnet_only: true,
+            allowed_relays: vec!["https://relay.example.ts.net:10443".into()],
+            tailnet_bind: Some("100.64.1.10".into()),
+            ..NetOpts::default()
+        };
+        let relays = relays_for(None, &opts).await.unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].port(), Some(10443));
+        assert_eq!(relays[0].as_str(), "https://relay.example.ts.net:10443/");
+        let relays = relays_for(Some("https://relay.example.ts.net:10443"), &opts).await.unwrap();
+        assert_eq!(relays[0].port(), Some(10443));
+        let err = relays_for(Some("https://other.example.ts.net:10443"), &opts).await.unwrap_err().to_string();
+        assert!(err.contains("not in config relays"), "{err}");
+        let empty = NetOpts { allowed_relays: vec![], ..opts };
+        assert!(relays_for(None, &empty).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tailnet_only_fails_without_a_tailscale_interface() {
+        let opts = NetOpts {
+            tailnet_only: true,
+            allowed_relays: vec!["https://relay.example.ts.net:10443".into()],
+            tailnet_bind: Some("127.0.0.1".into()),
+            ..NetOpts::default()
+        };
+        let err = match bind(SecretKey::generate(), None, &opts).await {
+            Ok(b) => {
+                b.endpoint.close().await;
+                panic!("expected bind to fail without a Tailscale address");
+            }
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("not a Tailscale address") || err.contains("no Tailscale interface"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn without_tailnet_only_behaviour_is_unchanged_for_own_relay() {
+        let b =
+            bind(SecretKey::generate(), Some("https://relay.example.com"), &NetOpts::plain(false, None)).await.unwrap();
+        assert_eq!(b.relays.len(), 1);
+        assert!(!b.opts.tailnet_only);
+        assert!(!EndpointPlan::for_opts(&b.opts, true).portmapper_disabled);
+        assert!(b.endpoint.bound_sockets().iter().any(|a| a.ip().is_unspecified()));
+        b.endpoint.close().await;
     }
 }
