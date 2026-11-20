@@ -94,7 +94,8 @@ impl NetOpts {
 pub struct EndpointPlan {
     pub minimal_preset: bool,
     pub portmapper_disabled: bool,
-    pub net_report_minimal: bool,
+    /// Use [`tailnet_net_report_config`]: captive portal off, HTTPS probes on (TCP-only relays).
+    pub net_report_tailnet: bool,
     pub dns_no_public_fallback: bool,
     pub bind_tailnet_only: bool,
     pub ignore_http_proxy: bool,
@@ -106,7 +107,7 @@ impl EndpointPlan {
             Self {
                 minimal_preset: true,
                 portmapper_disabled: true,
-                net_report_minimal: true,
+                net_report_tailnet: true,
                 dns_no_public_fallback: true,
                 bind_tailnet_only: true,
                 ignore_http_proxy: true,
@@ -115,13 +116,26 @@ impl EndpointPlan {
             Self {
                 minimal_preset: own,
                 portmapper_disabled: false,
-                net_report_minimal: false,
+                net_report_tailnet: false,
                 dns_no_public_fallback: false,
                 bind_tailnet_only: false,
                 ignore_http_proxy: false,
             }
         }
     }
+}
+
+/// NetReport under `tailnet_only`: keep captive-portal checks off, but leave HTTPS latency probes on.
+///
+/// A TCP-only `iroh-relay` (typical behind Tailscale Serve without QUIC) is never selected when
+/// `https_probes` is false — `preferred_relay` stays `None` and `init --relay` fails with "couldn't
+/// reach relay" (iroh 1.4.1). Those probes issue an empty HTTPS GET to each relay in this endpoint's
+/// `RelayMap` only (the URLs from `RelayMode::custom` / config `relays`), not to public Reason or n0
+/// relays. Captive-portal GETs to `/generate_204` stay disabled.
+pub fn tailnet_net_report_config() -> NetReportConfig {
+    let mut nr = NetReportConfig::minimal();
+    nr.https_probes = true;
+    nr
 }
 
 /// Parse a relay URL the way non-`tailnet_only` paths always did (scheme not forced).
@@ -435,9 +449,10 @@ async fn endpoint(
     // The default relays, with n0's address lookup still: that is how a teammate on an older Reason Network (on n0's
     // relays) and this machine find each other, and what four-word codes need. The team's own relay and nothing of
     // n0's: none of its relays, no publishing or looking up addresses in its DNS; teammates are dialed through it.
-    // `tailnet_only` always uses Minimal (no pkarr/DNS), disables the portmapper and NetReport HTTPS/captive probes,
-    // uses system DNS without public fallbacks, skips mDNS/HTTPS_PROXY, and binds only on the Tailscale interface
-    // (never 0.0.0.0 / ::). The same plan applies to every secondary endpoint (invite, route_loop probe, check_relay).
+    // `tailnet_only` always uses Minimal (no pkarr/DNS), disables the portmapper, keeps NetReport HTTPS probes on
+    // (needed for TCP-only relays) with captive-portal checks off, uses system DNS without public fallbacks, skips
+    // mDNS/HTTPS_PROXY, and binds only on the Tailscale interface (never 0.0.0.0 / ::). The same plan applies to every
+    // secondary endpoint (invite, route_loop probe, check_relay).
     let builder = || -> Result<Builder> {
         let relay_mode = if relays.is_empty() { RelayMode::Disabled } else { RelayMode::custom(relays.to_vec()) };
         let mut b =
@@ -447,8 +462,8 @@ async fn endpoint(
         if plan.portmapper_disabled {
             b = b.portmapper_config(PortmapperConfig::Disabled);
         }
-        if plan.net_report_minimal {
-            b = b.net_report_config(NetReportConfig::minimal());
+        if plan.net_report_tailnet {
+            b = b.net_report_config(tailnet_net_report_config());
         }
         if plan.dns_no_public_fallback {
             b = b.dns_resolver(tailnet_dns_resolver(opts.tailnet_dns.as_deref())?);
@@ -1816,7 +1831,7 @@ mod tests {
             let plan = EndpointPlan::for_opts(&opts, own);
             assert!(plan.minimal_preset, "own={own}");
             assert!(plan.portmapper_disabled, "own={own}");
-            assert!(plan.net_report_minimal, "own={own}");
+            assert!(plan.net_report_tailnet, "own={own}");
             assert!(plan.dns_no_public_fallback, "own={own}");
             assert!(plan.bind_tailnet_only, "own={own}");
             assert!(plan.ignore_http_proxy, "own={own}");
@@ -1828,13 +1843,22 @@ mod tests {
         let off = EndpointPlan::for_opts(&NetOpts::plain(true, None), false);
         assert!(!off.minimal_preset);
         assert!(!off.portmapper_disabled);
-        assert!(!off.net_report_minimal);
+        assert!(!off.net_report_tailnet);
         assert!(!off.dns_no_public_fallback);
         assert!(!off.bind_tailnet_only);
         assert!(!off.ignore_http_proxy);
         let own_off = EndpointPlan::for_opts(&NetOpts::plain(false, None), true);
         assert!(own_off.minimal_preset);
         assert!(!own_off.portmapper_disabled);
+    }
+
+    #[test]
+    fn tailnet_net_report_keeps_https_probes_for_tcp_only_relays() {
+        let nr = tailnet_net_report_config();
+        assert!(nr.https_probes, "TCP-only relays need HTTPS probes or preferred_relay stays None");
+        assert!(!nr.captive_portal_check, "captive-portal GETs stay off under tailnet_only");
+        let bare = NetReportConfig::minimal();
+        assert!(!bare.https_probes && !bare.captive_portal_check);
     }
 
     #[test]

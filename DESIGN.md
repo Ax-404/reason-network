@@ -567,8 +567,10 @@ shares the same plan in `src/net.rs` (`EndpointPlan`):
 - `presets::Minimal` (no n0 pkarr/DNS discovery), mDNS off, portmapper disabled
 - DNS: system resolvers only, or optional `tailnet_dns` (e.g. MagicDNS `100.100.100.100`), with public fallbacks
   (1.1.1.1 / 8.8.8.8 / Quad9 / DoH) disabled via `DnsResolver::builder().disable_fallback()`
-- NetReport: `NetReportConfig::minimal()` — no HTTPS latency probes and no captive-portal checks; remaining QUIC
-  address discovery only targets the configured relays
+- NetReport: captive-portal checks off, but HTTPS latency probes **on** (`tailnet_net_report_config` in `src/net.rs`).
+  A TCP-only `iroh-relay` (Tailscale Serve without QUIC) never gets a `preferred_relay` when `https_probes` is false
+  (iroh 1.4.1). Those probes are empty HTTPS GETs to each relay in this endpoint's `RelayMap` only (config `relays` /
+  team relay), not to public Reason or n0 hosts; QUIC address discovery also only targets that map
 - `HTTPS_PROXY` / `ALL_PROXY` ignored for iroh (no off-tailnet CONNECT; `route_loop` does not switch via a proxy)
 - uses only relays listed in `relays` (never `DEFAULT_RELAYS` or `https://reasonmachines.com/network/relays.json`); a
   team relay must be on that list; HTTPS URLs may include a non-443 port
